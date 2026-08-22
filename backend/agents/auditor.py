@@ -7,6 +7,7 @@ Returns a list of structured bug reports with suggested fixes, scores, and a sec
 import os
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -404,6 +405,16 @@ def _format_errors_for_prompt(console_errors: list, network_errors: list) -> str
     return "\n".join(lines) if lines else "No runtime errors detected."
 
 
+def _run_security_check(security_context_prompt: str, system_instruction: str, fallback: dict) -> dict:
+    try:
+        response = generate_content_with_fallback(security_context_prompt, system_instruction=system_instruction)
+        parsed = _extract_json_object(response.text)
+        return parsed or fallback
+    except Exception as error:
+        print(f"[Auditor] Security check failed: {type(error).__name__}")
+        return fallback
+
+
 def audit_errors(explorer_result: dict, repo_path: str) -> tuple[list[dict], dict, dict]:
     """
     Map runtime errors to source code and generate fix suggestions.
@@ -583,55 +594,24 @@ SOURCE CODE:
 Return ONLY the JSON structure according to the security check system prompt guidelines.
 """
 
-    # Check 1: Secrets
-    sec_1_data = {}
-    try:
-        r1 = generate_content_with_fallback(security_context_prompt, system_instruction=SEC_CHECK_1_SECRETS)
-        sec_1_data = _extract_json_object(r1.text)
-    except Exception as e:
-        print(f"[Auditor] Security Check 1 failed: {e}")
-    if not sec_1_data:
-        sec_1_data = {"findings": [], "summary": "Secrets check failed or completed with no findings.", "secrets_found": 0, "critical_count": 0}
+    security_checks = [
+        (SEC_CHECK_1_SECRETS, {"findings": [], "summary": "Secrets check failed or completed with no findings.", "secrets_found": 0, "critical_count": 0}),
+        (SEC_CHECK_2_DATA_FLOW, {"findings": [], "data_flows": [], "summary": "Data flow check failed or completed with no findings.", "pii_exposure_count": 0}),
+        (SEC_CHECK_3_PREDEPLOY, {"findings": [], "deploy_ready": True, "blockers": [], "warnings": [], "summary": "Pre-deploy check failed or completed with no findings."}),
+        (SEC_CHECK_4_DEEP, {"findings": [], "critical_paths": [], "summary": "Deep logic check failed or completed with no findings.", "exploitable_count": 0}),
+        (SEC_CHECK_5_ATTACKER, {"findings": [], "attack_surface": [], "summary": "Attacker view check failed or completed with no findings.", "critical_attack_paths": 0}),
+    ]
+    use_parallel = os.getenv("LLM_PROVIDER", "gemini").strip().lower() != "ollama" and os.getenv("AUDITOR_PARALLEL_SECURITY", "true").strip().lower() not in {"0", "false", "no", "off"}
+    if use_parallel:
+        with ThreadPoolExecutor(max_workers=5, thread_name_prefix="auditor-security") as executor:
+            security_results = list(executor.map(
+                lambda check: _run_security_check(security_context_prompt, check[0], check[1]),
+                security_checks,
+            ))
+    else:
+        security_results = [_run_security_check(security_context_prompt, instruction, fallback) for instruction, fallback in security_checks]
 
-    # Check 2: Data Flow
-    sec_2_data = {}
-    try:
-        r2 = generate_content_with_fallback(security_context_prompt, system_instruction=SEC_CHECK_2_DATA_FLOW)
-        sec_2_data = _extract_json_object(r2.text)
-    except Exception as e:
-        print(f"[Auditor] Security Check 2 failed: {e}")
-    if not sec_2_data:
-        sec_2_data = {"findings": [], "data_flows": [], "summary": "Data flow check failed or completed with no findings.", "pii_exposure_count": 0}
-
-    # Check 3: Pre-Deploy
-    sec_3_data = {}
-    try:
-        r3 = generate_content_with_fallback(security_context_prompt, system_instruction=SEC_CHECK_3_PREDEPLOY)
-        sec_3_data = _extract_json_object(r3.text)
-    except Exception as e:
-        print(f"[Auditor] Security Check 3 failed: {e}")
-    if not sec_3_data:
-        sec_3_data = {"findings": [], "deploy_ready": True, "blockers": [], "warnings": [], "summary": "Pre-deploy check failed or completed with no findings."}
-
-    # Check 4: Deep
-    sec_4_data = {}
-    try:
-        r4 = generate_content_with_fallback(security_context_prompt, system_instruction=SEC_CHECK_4_DEEP)
-        sec_4_data = _extract_json_object(r4.text)
-    except Exception as e:
-        print(f"[Auditor] Security Check 4 failed: {e}")
-    if not sec_4_data:
-        sec_4_data = {"findings": [], "critical_paths": [], "summary": "Deep logic check failed or completed with no findings.", "exploitable_count": 0}
-
-    # Check 5: Attacker
-    sec_5_data = {}
-    try:
-        r5 = generate_content_with_fallback(security_context_prompt, system_instruction=SEC_CHECK_5_ATTACKER)
-        sec_5_data = _extract_json_object(r5.text)
-    except Exception as e:
-        print(f"[Auditor] Security Check 5 failed: {e}")
-    if not sec_5_data:
-        sec_5_data = {"findings": [], "attack_surface": [], "summary": "Attacker view check failed or completed with no findings.", "critical_attack_paths": 0}
+    sec_1_data, sec_2_data, sec_3_data, sec_4_data, sec_5_data = security_results
 
     # Calculate totals
     total_findings = 0
