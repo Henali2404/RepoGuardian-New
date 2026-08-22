@@ -87,8 +87,6 @@ SUPABASE_SERVICE_KEY=your-supabase-service-role-key
 
 Use `LLM_PROVIDER=gemini` with `GEMINI_API_KEY` when using Gemini. Keep `.env` files private and never expose `SUPABASE_SERVICE_KEY` or GitHub tokens to the browser.
 
-Optional performance settings are documented in `backend/.env.example`. Response caching is bounded and can be disabled with `LLM_CACHE_ENABLED=false`. Gemini security checks run concurrently by default; set `AUDITOR_PARALLEL_SECURITY=false` to force sequential checks, which can be useful for a constrained local provider.
-
 Start the API from the `backend` directory:
 
 ```powershell
