@@ -1,0 +1,55 @@
+name: REPOGUARDIAN — Agent Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "GitHub repo URL to analyze"
+        required: true
+        type: string
+      job_id:
+        description: "Job ID for result tracking"
+        required: true
+        type: string
+
+jobs:
+  run-agents:
+    name: Run Analysis Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout this repo (for agent code)
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: |
+          cd backend
+          playwright install chromium --with-deps
+
+      - name: Run analysis pipeline
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          cd backend
+          python run_job.py "${{ inputs.repo_url }}" "${{ inputs.job_id }}"
+
+      - name: Upload result artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: analysis-result-${{ inputs.job_id }}
+          path: backend/result_${{ inputs.job_id }}.json
+          retention-days: 1
