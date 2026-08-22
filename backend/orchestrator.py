@@ -101,6 +101,98 @@ def run_analysis(job_id: str, repo_url: str, jobs: dict, user_id: str | None = N
         check_cancelled(jobs, job_id)
         log(jobs, job_id, "Auditor", "Mapping errors to source code lines...")
         bugs, scores, security_report = audit_errors(explorer_result, tmp_path)
+
+        # Merge findings from advanced scanner
+        scanner_findings = scan_result.get("scanner_findings", {})
+        scanner_bugs = scanner_findings.get("bugs", [])
+        scanner_security_findings = scanner_findings.get("security_findings", [])
+
+        # Merge bugs
+        existing_keys = {(b.get("file"), b.get("line_number")) for b in bugs if b.get("file") and b.get("line_number")}
+        for sb in scanner_bugs:
+            key = (sb.get("file"), sb.get("line_number"))
+            if key not in existing_keys:
+                bugs.append(sb)
+
+        # Merge security findings
+        if security_report and scanner_security_findings:
+            for sf in scanner_security_findings:
+                check_id = sf.get("check_id", "")
+                severity = sf.get("severity", "warning").lower()
+                
+                # Check 1: Secrets
+                if check_id == "SEC-001":
+                    sec_key = "check_1_secrets"
+                    if sec_key not in security_report:
+                        security_report[sec_key] = {"findings": [], "summary": "", "secrets_found": 0, "critical_count": 0}
+                    if not any(f.get("file_name") == sf["file_name"] and f.get("line_hint") == sf["line_hint"] for f in security_report[sec_key]["findings"]):
+                        security_report[sec_key]["findings"].append(sf)
+                        security_report[sec_key]["secrets_found"] = security_report[sec_key].get("secrets_found", 0) + 1
+                        if severity == "critical":
+                            security_report[sec_key]["critical_count"] = security_report[sec_key].get("critical_count", 0) + 1
+                            
+                # Check 3: Pre-deploy
+                elif check_id in ("SEC-006", "CONF-001"):
+                    sec_key = "check_3_predeploy"
+                    if sec_key not in security_report:
+                        security_report[sec_key] = {"findings": [], "deploy_ready": True, "blockers": [], "warnings": [], "summary": ""}
+                    if not any(f.get("file_name") == sf["file_name"] and f.get("line_hint") == sf["line_hint"] for f in security_report[sec_key]["findings"]):
+                        security_report[sec_key]["findings"].append(sf)
+                        if severity == "critical":
+                            security_report[sec_key]["blockers"].append(sf.get("title"))
+                            security_report[sec_key]["deploy_ready"] = False
+                        else:
+                            security_report[sec_key]["warnings"].append(sf.get("title"))
+                            
+                # Check 4: Deep Logic Audit
+                elif check_id in ("SEC-002", "SEC-003", "SEC-004", "SEC-005", "BUG-001"):
+                    sec_key = "check_4_deep"
+                    if sec_key not in security_report:
+                        security_report[sec_key] = {"findings": [], "critical_paths": [], "summary": "", "exploitable_count": 0}
+                    if not any(f.get("file_name") == sf["file_name"] and f.get("line_hint") == sf["line_hint"] for f in security_report[sec_key]["findings"]):
+                        security_report[sec_key]["findings"].append(sf)
+                        security_report[sec_key]["exploitable_count"] = security_report[sec_key].get("exploitable_count", 0) + 1
+                        if severity in ("critical", "high"):
+                            security_report[sec_key]["critical_paths"].append(sf.get("title"))
+                            
+                # Check 5: Attacker View
+                else:
+                    sec_key = "check_5_attacker"
+                    if sec_key not in security_report:
+                        security_report[sec_key] = {"findings": [], "attack_surface": [], "summary": "", "critical_attack_paths": 0}
+                    if not any(f.get("file_name") == sf["file_name"] and f.get("line_hint") == sf["line_hint"] for f in security_report[sec_key]["findings"]):
+                        security_report[sec_key]["findings"].append(sf)
+                        if severity in ("critical", "high"):
+                            security_report[sec_key]["critical_attack_paths"] = security_report[sec_key].get("critical_attack_paths", 0) + 1
+                            security_report[sec_key]["attack_surface"].append(sf.get("title"))
+
+            # Recalculate security report totals
+            total_findings = 0
+            critical_total = 0
+            for sec_key in ["check_1_secrets", "check_2_data_flow", "check_3_predeploy", "check_4_deep", "check_5_attacker"]:
+                if sec_key in security_report:
+                    flist = security_report[sec_key].get("findings", [])
+                    total_findings += len(flist)
+                    for f in flist:
+                        if f.get("severity") == "critical":
+                            critical_total += 1
+            security_report["total_findings"] = total_findings
+            security_report["critical_total"] = critical_total
+
+        # Recalculate scores based on merged findings
+        if scores:
+            criticals = sum(1 for b in bugs if b.get("severity") == "critical")
+            warnings = sum(1 for b in bugs if b.get("severity") == "warning")
+            infos = sum(1 for b in bugs if b.get("severity") == "info")
+            
+            score = 100 - (criticals * 15) - (warnings * 5) - (infos * 2)
+            score = max(0, score)
+            
+            scores["health"] = min(scores.get("health", 100), score)
+            scores["code_quality"] = min(scores.get("code_quality", 100), max(0, score - 5))
+            scores["maintainability"] = min(scores.get("maintainability", 100), max(0, score - 5))
+            scores["security"] = min(scores.get("security", 100), max(0, score - 10) if criticals > 0 else score)
+
         try:
             db.save_scores(job_id, scores)
             db.save_security_report(job_id, security_report)
@@ -114,6 +206,35 @@ def run_analysis(job_id: str, repo_url: str, jobs: dict, user_id: str | None = N
         check_cancelled(jobs, job_id)
         log(jobs, job_id, "Architect", "Scanning for performance, security & architecture issues...")
         arch_result = analyze_architecture(tmp_path, scan_result)
+
+        # Merge architecture issues from advanced scanner
+        scanner_static_issues = scanner_findings.get("static_issues", [])
+        if arch_result and scanner_static_issues:
+            existing_arch_keys = {(i.get("file"), i.get("line"), i.get("title")) for i in arch_result.get("static_issues", [])}
+            for si in scanner_static_issues:
+                key = (si.get("file"), si.get("line"), si.get("title"))
+                if key not in existing_arch_keys:
+                    arch_result["static_issues"].append(si)
+            
+            # Recalculate summary and scores
+            static_issues = arch_result.get("static_issues", [])
+            arch_result["summary"] = {
+                "critical": sum(1 for i in static_issues if i.get("severity") == "critical"),
+                "warnings": sum(1 for i in static_issues if i.get("severity") == "warning"),
+                "info": sum(1 for i in static_issues if i.get("severity") == "info"),
+            }
+            
+            score = 100
+            for issue in static_issues:
+                severity = issue.get("severity", "warning")
+                if severity == "critical":
+                    score -= 15
+                elif severity == "warning":
+                    score -= 5
+                elif severity == "info":
+                    score -= 2
+            arch_result["score"] = max(0, score)
+
         issue_count = len(arch_result.get("static_issues", []))
         log(jobs, job_id, "Architect",
             f"Found {issue_count} static issue(s). AI analysis complete ✓", "success")
