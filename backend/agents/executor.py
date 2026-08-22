@@ -8,6 +8,7 @@ Executor Agent — "The PR Bot"
 import os
 import re
 import json
+import subprocess
 
 from dotenv import load_dotenv
 from github import Github, GithubException
@@ -58,70 +59,74 @@ def _extract_code_from_response(response_text: str, original: str) -> str:
     return text
 
 
-def generate_diffs(bugs: list, repo_path: str) -> list:
-    """
-    For each bug, generate the fixed file content.
-    Returns list of diff objects.
-    """
+def _extract_replacement(response_text: str) -> str:
+    """Extract a replacement block without requiring it to resemble a full file."""
+    text = response_text.strip("\r\n")
+    fence_match = re.search(r"```(?:\w+)?\n([\s\S]+?)```", text)
+    return fence_match.group(1).strip("\r\n") if fence_match else text
+
+
+def _validate_candidate(repo_path: str, file_path: str, candidate: str, old_block: str) -> tuple[bool, str]:
+    """Validate a candidate and reject it when the original target remains."""
+    if old_block.strip() and old_block in candidate:
+        return False, "The original issue block is still present after the patch."
+    full_path = os.path.join(repo_path, file_path)
+    try:
+        with open(full_path, "w", encoding="utf-8") as file:
+            file.write(candidate)
+        if file_path.endswith(".py"):
+            result = subprocess.run(["python", "-m", "py_compile", full_path], capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                return False, result.stderr.strip() or "Python syntax validation failed."
+        elif file_path.endswith((".js", ".mjs", ".cjs")):
+            result = subprocess.run(["node", "--check", full_path], capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                return False, result.stderr.strip() or "JavaScript syntax validation failed."
+        return True, "Patch applied and validation passed."
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, f"Validation failed: {error}"
+
+
+def generate_diffs(fix_plans: list, repo_path: str) -> list:
+    """Generate and validate small replacements described by Architect plans."""
     diffs = []
-
-    # Emit one remediation record for every detected issue. Issues without a
-    # readable file remain visible with their suggested manual fix.
-    fixable = bugs
-
-    for bug in fixable:
-        file_path = bug.get("file") or "unknown"
+    for plan in fix_plans:
+        finding = plan.get("finding", plan.get("bug", {}))
+        file_path = plan.get("file") or finding.get("file") or "unknown"
         original_content = _read_file(repo_path, file_path) if file_path != "unknown" else None
         if original_content is None:
-            diffs.append({
-            "file": file_path,
-                "original": "",
-                "fixed": "",
-                "bug": bug,
-                "success": False,
-                "error": "Automatic patch unavailable: source file could not be read.",
-            })
+            diffs.append({"file": file_path, "original": "", "fixed": "", "bug": finding, "plan": plan,
+                          "success": False, "error": "Automatic patch unavailable: source file could not be read."})
             continue
 
-        prompt = f"""You are a code fixing assistant. Fix the following bug in this file.
-
-BUG:
-- File: {bug['file']}
-- Line: {bug.get('line_number', 'unknown')}
-- Type: {bug['error_type']}
-- Description: {bug['error_description']}
-- Suggested fix: {bug['suggested_fix']}
-- Problematic code: {bug.get('code_snippet', '')}
-
-ORIGINAL FILE CONTENT:
-{original_content}
-Return ONLY the complete fixed file content, with NO explanation, NO markdown fences, NO preamble.
-Just the raw fixed code that can be directly written to the file.
-Make the minimal change needed to fix the specific bug described. Do not refactor unrelated code."""
+        prompt = f"""You are a code fixing assistant. Apply only this verified fix plan.
+FIX PLAN:
+{json.dumps(plan, indent=2)}
+TARGETED CODE CONTEXT:
+{finding.get('relevant_code_context', finding.get('code_snippet', ''))}
+Return ONLY replacement code for lines {plan.get('start_line')} through {plan.get('end_line')}.
+Do not return the complete file, line numbers, markdown fences, or an explanation."""
 
         try:
             response = generate_content_with_fallback(prompt)
-            fixed_content = _extract_code_from_response(response.text, original_content)
-
-            diffs.append({
-                "file": bug["file"],
-                "original": original_content,
-                "fixed": fixed_content,
-                "bug": bug,
-                "success": True,
-                "error": None,
-            })
-
-        except Exception as e:
-            diffs.append({
-                "file": bug["file"],
-                "original": original_content,
-                "fixed": original_content,  # No change on failure
-                "bug": bug,
-                "success": False,
-                "error": str(e),
-            })
-
+            replacement = _extract_replacement(response.text)
+            lines = original_content.splitlines(keepends=True)
+            start = max(1, int(plan.get("start_line", 1)))
+            end = min(len(lines), int(plan.get("end_line", start)))
+            old_block = "".join(lines[start - 1:end])
+            newline = "" if replacement.endswith(("\n", "\r")) else "\n"
+            fixed_content = "".join(lines[:start - 1]) + replacement + newline + "".join(lines[end:])
+            valid, validation_message = _validate_candidate(repo_path, file_path, fixed_content, old_block)
+            if not valid:
+                with open(os.path.join(repo_path, file_path), "w", encoding="utf-8") as file:
+                    file.write(original_content)
+            diffs.append({"file": file_path, "original": original_content,
+                          "fixed": fixed_content if valid else original_content, "bug": finding, "plan": plan,
+                          "success": valid, "validation": {"passed": valid, "message": validation_message},
+                          "error": None if valid else validation_message})
+        except Exception as error:
+            diffs.append({"file": file_path, "original": original_content, "fixed": original_content,
+                          "bug": finding, "plan": plan, "success": False, "error": str(error)})
     return diffs
 
 
