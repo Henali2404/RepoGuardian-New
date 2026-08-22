@@ -1,8 +1,5 @@
 import os
 import time
-import hashlib
-import threading
-from collections import OrderedDict
 import httpx
 import google.generativeai as genai
 from google.oauth2 import service_account
@@ -12,12 +9,6 @@ INVALID_KEYS = set()
 
 # In-memory dict to track rate-limit cooldowns (key -> timestamp of last 429)
 RATE_LIMIT_COOLDOWNS = {}
-MODEL_CACHE = {}
-RESPONSE_CACHE = OrderedDict()
-CACHE_LOCK = threading.Lock()
-MODEL_LOCK = threading.Lock()
-CACHE_HITS = 0
-CACHE_MISSES = 0
 
 
 class _OllamaResponse:
@@ -25,73 +16,7 @@ class _OllamaResponse:
         self.text = text
 
 
-def _cache_enabled() -> bool:
-    return os.getenv("LLM_CACHE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
-
-
-def _cache_key(provider: str, model_name: str, prompt: str, system_instruction: str = None) -> str:
-    payload = "\0".join((provider, model_name, system_instruction or "", prompt))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _cache_get(key: str):
-    global CACHE_HITS, CACHE_MISSES
-    if not _cache_enabled():
-        return None
-    now = time.time()
-    ttl = float(os.getenv("LLM_CACHE_TTL_SECONDS", "900"))
-    with CACHE_LOCK:
-        cached = RESPONSE_CACHE.get(key)
-        if cached and now - cached[0] <= ttl:
-            RESPONSE_CACHE.move_to_end(key)
-            CACHE_HITS += 1
-            return _OllamaResponse(cached[1])
-        if cached:
-            RESPONSE_CACHE.pop(key, None)
-        CACHE_MISSES += 1
-    return None
-
-
-def _cache_put(key: str, text: str):
-    if not _cache_enabled() or not isinstance(text, str) or not text:
-        return
-    max_entries = max(1, int(os.getenv("LLM_CACHE_MAX_ENTRIES", "128")))
-    with CACHE_LOCK:
-        RESPONSE_CACHE[key] = (time.time(), text)
-        RESPONSE_CACHE.move_to_end(key)
-        while len(RESPONSE_CACHE) > max_entries:
-            RESPONSE_CACHE.popitem(last=False)
-
-
-def _log_request(provider: str, model: str, started: float, success: bool, retry: int, prompt_chars: int, response_chars: int = 0, error=None):
-    event = {
-        "provider": provider,
-        "model": model,
-        "duration_ms": round((time.perf_counter() - started) * 1000, 1),
-        "success": success,
-        "retry": retry,
-        "prompt_chars": prompt_chars,
-        "response_chars": response_chars,
-    }
-    if error:
-        event["error_type"] = type(error).__name__
-        event["error_status"] = getattr(getattr(error, "response", None), "status_code", None)
-    print(f"[LLM_METRIC] {event}")
-
-
-def _get_gemini_model(model_name: str, system_instruction: str, auth_fingerprint: str, configure):
-    cache_key = (model_name, system_instruction or "", auth_fingerprint)
-    configure()
-    with MODEL_LOCK:
-        model = MODEL_CACHE.get(cache_key)
-        if model is None:
-            model = genai.GenerativeModel(model_name=model_name, system_instruction=system_instruction)
-            MODEL_CACHE[cache_key] = model
-        return model
-
-
 def _generate_with_ollama(prompt: str, system_instruction: str = None):
-    started = time.perf_counter()
     base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
     model = os.getenv("OLLAMA_MODEL", "").strip()
     if not model:
@@ -114,31 +39,22 @@ def _generate_with_ollama(prompt: str, system_instruction: str = None):
                 "prompt": combined_prompt,
                 "stream": False,
             },
-            timeout=httpx.Timeout(
-                connect=float(os.getenv("OLLAMA_CONNECT_TIMEOUT_SECONDS", "10")),
-                read=float(os.getenv("OLLAMA_READ_TIMEOUT_SECONDS", "180")),
-                write=60.0,
-                pool=10.0,
-            ),
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0),
         )
         response.raise_for_status()
         response_data = response.json()
     except httpx.HTTPStatusError as error:
-        _log_request("ollama", model, started, False, 1, len(combined_prompt), error=error)
         raise RuntimeError(
             f"Local Ollama provider failed with HTTP {error.response.status_code}"
         ) from error
     except httpx.HTTPError as error:
-        _log_request("ollama", model, started, False, 1, len(combined_prompt), error=error)
         raise RuntimeError("Local Ollama provider failed to connect") from error
     except ValueError as error:
-        _log_request("ollama", model, started, False, 1, len(combined_prompt), error=error)
         raise RuntimeError("Local Ollama provider returned invalid JSON") from error
 
     generated_text = response_data.get("response") if isinstance(response_data, dict) else None
     if not isinstance(generated_text, str):
         raise RuntimeError("Local Ollama provider returned no response text")
-    _log_request("ollama", model, started, True, 1, len(combined_prompt), len(generated_text))
     return _OllamaResponse(generated_text)
 
 def get_service_account_credentials():
@@ -168,41 +84,40 @@ def generate_content_with_fallback(
     system_instruction: str = None,
     max_retries_per_key: int = 3
 ):
-    """Call the configured provider while preserving the response.text contract."""
-    provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
-    provider_model = os.getenv("OLLAMA_MODEL", "").strip() if provider == "ollama" else model_name
-    key = _cache_key(provider, provider_model, prompt, system_instruction)
-    cached = _cache_get(key)
-    if cached:
-        print(f"[LLM_METRIC] cache_hit provider={provider} model={provider_model} prompt_chars={len(prompt)}")
-        return cached
-
-    if provider == "ollama":
-        response = _generate_with_ollama(prompt, system_instruction)
-        _cache_put(key, response.text)
-        return response
+    """
+    Tries calling Gemini API using Service Account credentials first,
+    then falls back to API keys (GEMINI_API_KEY_1 to 5) one-by-one.
+    """
+    if os.getenv("LLM_PROVIDER", "gemini").strip().lower() == "ollama":
+        return _generate_with_ollama(prompt, system_instruction)
 
     # 1. Try Service Account credentials if available
     creds = get_service_account_credentials()
     if creds:
         for attempt in range(1, max_retries_per_key + 1):
-            started = time.perf_counter()
             try:
-                model = _get_gemini_model(
-                    model_name, system_instruction, "service-account",
-                    lambda: genai.configure(credentials=creds),
+                print(f"[Gemini Client] Attempting request using Service Account Credentials - Attempt {attempt}/{max_retries_per_key}")
+                genai.configure(credentials=creds)
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    system_instruction=system_instruction
                 )
                 response = model.generate_content(prompt)
-                text = response.text
-                _log_request("gemini-service-account", model_name, started, True, attempt, len(prompt), len(text))
-                _cache_put(key, text)
+                # Access text property to ensure call succeeded
+                _ = response.text
+                print("[Gemini Client] Request succeeded using Service Account Credentials")
                 return response
             except Exception as e:
                 err_str = str(e).lower()
-                _log_request("gemini-service-account", model_name, started, False, attempt, len(prompt), error=e)
-                if not any(kw in err_str for kw in ["429", "quota", "resource_exhausted", "timeout", "temporarily", "unavailable", "503"]):
+                print(f"[Gemini Client] Service Account attempt {attempt} failed: {e}")
+                
+                # Check for rate-limiting or quota exhaustion (429)
+                if any(kw in err_str for kw in ["429", "quota", "resource_exhausted", "resourcehasbeenexhausted"]):
+                    wait_time = 2 * attempt
+                    time.sleep(wait_time)
+                else:
+                    # For auth errors or other non-transient failures, stop attempting and fall back to API keys
                     break
-                time.sleep(min(0.5 * (2 ** (attempt - 1)), 3.0))
 
     # 2. Fall back to API keys if Service Account is not configured or fails
 
@@ -239,23 +154,21 @@ def generate_content_with_fallback(
         masked_key = f"{key[:6]}...{key[-4:]}" if len(key) > 10 else "..."
         
         for attempt in range(1, max_retries_per_key + 1):
-            started = time.perf_counter()
             try:
                 print(f"[Gemini Client] Attempting request using Key #{idx} ({masked_key}) - Attempt {attempt}/{max_retries_per_key}")
-                model = _get_gemini_model(
-                    model_name, system_instruction, hashlib.sha256(key.encode()).hexdigest(),
-                    lambda: genai.configure(api_key=key),
+                
+                genai.configure(api_key=key)
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    system_instruction=system_instruction
                 )
                 response = model.generate_content(prompt)
-                text = response.text
-                _log_request("gemini-api-key", model_name, started, True, attempt, len(prompt), len(text))
-                _cache_put(key=_cache_key("gemini", model_name, prompt, system_instruction), text=text)
+                _ = response.text
                 print(f"[Gemini Client] Request succeeded with Key #{idx}")
                 return response
             except Exception as e:
                 last_err = e
                 err_str = str(e).lower()
-                _log_request("gemini-api-key", model_name, started, False, attempt, len(prompt), error=e)
                 
                 # Check for authentication/authorization errors (401, deleted service account, invalid key)
                 if any(kw in err_str for kw in ["401", "unauthenticated", "api_key_invalid", "deleted or disabled", "invalid authentication"]):
@@ -287,7 +200,7 @@ def generate_content_with_fallback(
                             except ValueError:
                                 pass
                     
-                    wait_time = min(retry_seconds, float(os.getenv("GEMINI_MAX_RETRY_DELAY_SECONDS", "8")))
+                    wait_time = min(retry_seconds + 1.0, 10.0)
                     print(f"[Gemini Client] Key #{idx} rate limited. Waiting {wait_time:.1f}s before retrying current key...")
                     time.sleep(wait_time)
                     continue  # Retry the current key instead of skipping to next key
@@ -296,7 +209,7 @@ def generate_content_with_fallback(
                 # For any other transient error
                 print(f"[Gemini Client] Key #{idx} error: {e}")
                 if attempt < max_retries_per_key:
-                    time.sleep(min(0.5 * (2 ** (attempt - 1)), 3.0))
+                    time.sleep(1)
 
     print(f"[Gemini Client] Warning: All Gemini API keys failed ({last_err}). Using intelligent rule fallback.")
     class FallbackResponse:

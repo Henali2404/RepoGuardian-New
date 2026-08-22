@@ -10,7 +10,6 @@ import re
 
 from dotenv import load_dotenv
 from agents.gemini_client import generate_content_with_fallback
-from analyzers.analyzer import run_advanced_scan
 
 load_dotenv()
 
@@ -190,10 +189,6 @@ Return this exact JSON structure:
     except Exception as e:
         print(f"[Scanner] LLM call failed (using static analysis only): {e}")
 
-    print("[Scanner] Running advanced static and AI scan...")
-    scanner_findings = run_advanced_scan(repo_path)
-    print(f"[Scanner] Advanced scan found {len(scanner_findings.get('bugs', []))} issues.")
-
     return {
         "framework": framework,
         "start_command": start_command,
@@ -207,5 +202,4 @@ Return this exact JSON structure:
         "has_package_json": bool(package_json),
         "is_python": is_python_project,
         "has_web_server": has_web_server,
-        "scanner_findings": scanner_findings,
     }
