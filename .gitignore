@@ -1,0 +1,62 @@
+# Dependencies and build output
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+out/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Python
+venv/
+.venv/
+**/venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS and editor
+Thumbs.db
+.DS_Store
+.vscode/
+
+# Runtime output and local data
+*.log
+logs/
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+*.tmp
+*.temp
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+playwright-report/
+test-results/
+
+# Local credentials and private keys
+.env
+.env.*
+!.env.example
+!frontend/.env.local.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.secret
+*.secrets
