@@ -24,6 +24,7 @@ For EVERY issue found, return these exact fields:
   issue_id: string in format RG-001, RG-002 etc
   issue_title: short clear title
   file_name: relative path to affected file
+    line_number: integer line where the issue is proven, or null when unavailable
   severity_level: must be exactly one of: critical, high, medium, low, info
   explanation: clear technical explanation of the problem
   recommended_fix: concrete actionable fix with code example if possible
@@ -404,7 +405,60 @@ def _format_errors_for_prompt(console_errors: list, network_errors: list) -> str
     return "\n".join(lines) if lines else "No runtime errors detected."
 
 
-def audit_errors(explorer_result: dict, repo_path: str) -> tuple[list[dict], dict, dict]:
+def _line_context(content: str, line_number: int | None, radius: int = 6) -> str:
+    lines = content.splitlines()
+    if not lines:
+        return ""
+    if not line_number:
+        return "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines[:40]))
+    start = max(0, line_number - radius - 1)
+    end = min(len(lines), line_number + radius)
+    return "\n".join(f"{i + 1}: {lines[i]}" for i in range(start, end))
+
+
+def _build_targeted_context(
+    source_files: dict[str, str],
+    explorer_result: dict,
+    scan_result: dict | None,
+) -> str:
+    """Build bounded evidence for the auditor instead of sending the repository."""
+    locations = []
+    for error in explorer_result.get("console_errors", []) + explorer_result.get("network_errors", []):
+        location = str(error.get("location", ""))
+        match = re.search(r"([^\\/:()\s]+(?:[\\/][^\\/:()\s]+)*)[:](\d+)", location)
+        if match:
+            locations.append((match.group(1).replace("\\", "/"), int(match.group(2))))
+
+    selected: list[tuple[str, int | None]] = []
+    for path, line_number in locations:
+        matches = [candidate for candidate in source_files if candidate.replace("\\", "/").endswith(path)]
+        if matches:
+            selected.append((matches[0], line_number))
+
+    if not selected and scan_result:
+        entry_file = scan_result.get("entry_file")
+        if entry_file and entry_file in source_files:
+            selected.append((entry_file, None))
+        for path in scan_result.get("file_tree", []):
+            if path in source_files and path != entry_file:
+                selected.append((path, None))
+                if len(selected) >= 4:
+                    break
+
+    if not selected:
+        selected = [(path, None) for path in list(source_files)[:4]]
+
+    blocks = []
+    for path, line_number in selected[:8]:
+        blocks.append(f"--- FILE: {path} ---\n{_line_context(source_files[path], line_number)}")
+    return "\n\n".join(blocks) or "No relevant source context was found."
+
+
+def audit_errors(
+    explorer_result: dict,
+    repo_path: str,
+    scan_result: dict | None = None,
+) -> tuple[list[dict], dict, dict]:
     """
     Map runtime errors to source code and generate fix suggestions.
     Returns: (merged_issues, scores, security_report)
@@ -426,44 +480,25 @@ def audit_errors(explorer_result: dict, repo_path: str) -> tuple[list[dict], dic
         }
         return ([], empty_scores, empty_sec)
 
-    # Pick the most relevant files (stay under ~40000 chars, slicing strictly at line boundaries)
-    priority_files = {}
-    other_files = {}
-    for path, content in source_files.items():
-        if any(seg in path for seg in ("src/", "app/", "components/", "pages/", "lib/")):
-            priority_files[path] = content
-        else:
-            other_files[path] = content
-
-    source_context = []
-    char_budget = 40000
-    for path, content in {**priority_files, **other_files}.items():
-        lines = content.splitlines()
-        file_snippet_lines = []
-        current_len = 0
-        for line in lines:
-            if current_len + len(line) + 1 > 4000:
-                break
-            file_snippet_lines.append(line)
-            current_len += len(line) + 1
-        
-        file_snippet = "\n".join(file_snippet_lines)
-        snippet = f"\n--- FILE: {path} ---\n{file_snippet}\n"
-        
-        if char_budget - len(snippet) < 0:
-            break
-        source_context.append(snippet)
-        char_budget -= len(snippet)
-
     errors_formatted = _format_errors_for_prompt(console_errors, network_errors)
+    targeted_context = _build_targeted_context(source_files, explorer_result, scan_result)
+    scanner_evidence = json.dumps({
+        "framework": (scan_result or {}).get("framework", "unknown"),
+        "entry_file": (scan_result or {}).get("entry_file"),
+        "has_tests": (scan_result or {}).get("has_tests", False),
+        "file_tree": (scan_result or {}).get("file_tree", [])[:40],
+    }, indent=2)
 
     analyst_prompt_input = f"""Analyze these runtime errors and the source code context.
 
 RUNTIME ERRORS:
 {errors_formatted}
 
-SOURCE CODE:
-{"".join(source_context)}
+SCANNER EVIDENCE:
+{scanner_evidence}
+
+RELEVANT SOURCE CONTEXT ONLY:
+{targeted_context}
 
 Return ONLY the JSON structure according to the system prompt guidelines.
 """
@@ -505,10 +540,26 @@ Return ONLY the JSON structure according to the system prompt guidelines.
         }
 
     # Step 3: Run REVIEWER_PROMPT via Gemini — validate every issue
-    reviewer_prompt_input = f"""Review and validate the analyst's findings for the codebase.
+    reviewer_context = []
+    for issue in analyst_data.get("issues", []):
+        if not isinstance(issue, dict):
+            continue
+        path = issue.get("file_name")
+        if path in source_files:
+            reviewer_context.append({
+                "issue_id": issue.get("issue_id"),
+                "file": path,
+                "code_context": _line_context(source_files[path], issue.get("line_number")),
+                "scanner_evidence": scanner_evidence,
+            })
+
+    reviewer_prompt_input = f"""Review and validate the analyst's findings using the evidence below.
 
 ANALYST FINDINGS:
 {json.dumps(analyst_data, indent=2)}
+
+FINDING EVIDENCE:
+{json.dumps(reviewer_context, indent=2)}
 
 Return ONLY the JSON structure according to the reviewer system prompt guidelines.
 """
@@ -559,11 +610,14 @@ Return ONLY the JSON structure according to the reviewer system prompt guideline
             "issue_id": issue_id,
             "issue_title": issue.get("issue_title", ""),
             "file_name": issue.get("file_name", "unknown"),
+            "line_number": issue.get("line_number"),
             "severity_level": issue.get("severity_level", "medium"),
             "explanation": issue.get("explanation", ""),
             "recommended_fix": issue.get("recommended_fix", ""),
             "estimated_impact": issue.get("estimated_impact", ""),
             "code_snippet": issue.get("code_snippet", ""),
+            "relevant_code_context": next((item["code_context"] for item in reviewer_context if item["issue_id"] == issue_id), ""),
+            "scanner_evidence": scanner_evidence,
 
             # New Reviewer fields
             "confidence_score": rev.get("confidence_score", 50),
@@ -574,7 +628,14 @@ Return ONLY the JSON structure according to the reviewer system prompt guideline
             "alternative_approaches": rev.get("alternative_approaches", "")
         })
 
+    for issue in merged_issues:
+        issue["verified"] = (
+            issue.get("review_verdict") in ("Approved", "Approved with Caution")
+            and int(issue.get("confidence_score") or 0) >= 60
+        )
+
     # Step 5: Run all 5 security checks in sequence
+    source_context = [f"\n--- FILE: {path} ---\n{content[:4000]}\n" for path, content in source_files.items()]
     security_context_prompt = f"""Analyze the following source code context for security issues.
 
 SOURCE CODE:

@@ -100,7 +100,7 @@ def run_analysis(job_id: str, repo_url: str, jobs: dict, user_id: str | None = N
         # ── STEP 4: Auditor Agent ──────────────────────────────────────────
         check_cancelled(jobs, job_id)
         log(jobs, job_id, "Auditor", "Mapping errors to source code lines...")
-        bugs, scores, security_report = audit_errors(explorer_result, tmp_path)
+        bugs, scores, security_report = audit_errors(explorer_result, tmp_path, scan_result)
         try:
             db.save_scores(job_id, scores)
             db.save_security_report(job_id, security_report)
@@ -108,23 +108,33 @@ def run_analysis(job_id: str, repo_url: str, jobs: dict, user_id: str | None = N
             print(f"[Orchestrator] Database save failed for auditor: {db_err}")
 
         log(jobs, job_id, "Auditor",
-            f"Identified {len(bugs)} fixable bug(s) in source code ✓", "success")
+            f"Verified {sum(1 for bug in bugs if bug.get('verified'))} of {len(bugs)} finding(s) ✓", "success")
 
         # ── STEP 5: Architect Agent ────────────────────────────────────────
         check_cancelled(jobs, job_id)
-        log(jobs, job_id, "Architect", "Scanning for performance, security & architecture issues...")
-        arch_result = analyze_architecture(tmp_path, scan_result)
-        issue_count = len(arch_result.get("static_issues", []))
+        verified_findings = [bug for bug in bugs if bug.get("verified")]
+        log(jobs, job_id, "Architect", f"Planning targeted fixes for {len(verified_findings)} verified finding(s)...")
+        arch_result = analyze_architecture(tmp_path, verified_findings)
+        fix_plans = arch_result.get("fix_plans", [])
+        findings_by_file = {}
+        for finding in verified_findings:
+            findings_by_file.setdefault(finding.get("file"), []).append(finding)
+        for plan in fix_plans:
+            candidates = findings_by_file.get(plan.get("file"), [])
+            if candidates:
+                plan["finding"] = candidates.pop(0)
+        issue_count = len(fix_plans)
         log(jobs, job_id, "Architect",
-            f"Found {issue_count} static issue(s). AI analysis complete ✓", "success")
+            f"Created {issue_count} targeted fix plan(s) ✓", "success")
 
         # ── STEP 6: Executor Agent ─────────────────────────────────────────
         check_cancelled(jobs, job_id)
-        if bugs:
-            log(jobs, job_id, "Executor", f"Generating code diffs for {len(bugs)} bug(s)...")
-            diffs = generate_diffs(bugs, tmp_path)
+        if fix_plans:
+            log(jobs, job_id, f"Executor", f"Applying and validating {len(fix_plans)} targeted patch(es)...")
+            diffs = generate_diffs(fix_plans, tmp_path)
+            accepted = sum(1 for diff in diffs if diff.get("success"))
             log(jobs, job_id, "Executor",
-                f"Generated {len(diffs)} fix(es). Awaiting human approval ✓", "success")
+                f"Accepted {accepted}/{len(diffs)} patch(es); failed patches were rolled back ✓", "success" if accepted else "warning")
         else:
             diffs = []
             log(jobs, job_id, "Executor", "No bugs to fix — skipping diff generation", "info")

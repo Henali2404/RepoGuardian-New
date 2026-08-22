@@ -146,51 +146,47 @@ def _static_analysis(repo_path: str, source_files: dict) -> list:
     return issues
 
 
-def _llm_analysis(source_files: dict, scan_result: dict) -> str:
-    """Get AI analysis of overall architecture quality."""
-    # Sample a few files for LLM (strictly slicing at line boundaries to prevent false errors)
-    sample = {}
-    budget = 40000
-    for path, content in list(source_files.items())[:5]:
-        lines = content.splitlines()
-        file_snippet_lines = []
-        current_len = 0
-        for line in lines:
-            if current_len + len(line) + 1 > 4000:
-                break
-            file_snippet_lines.append(line)
-            current_len += len(line) + 1
-        
-        file_snippet = "\n".join(file_snippet_lines)
-        if budget - len(file_snippet) < 0:
-            break
-        sample[path] = file_snippet
-        budget -= len(file_snippet)
+def _llm_analysis(source_files: dict[str, str], verified_findings: list[dict]) -> dict:
+    """Create bounded, line-specific fix plans from verified findings only."""
+    evidence = []
+    for finding in verified_findings:
+        path = finding.get("file") or finding.get("file_name")
+        if path not in source_files:
+            continue
+        lines = source_files[path].splitlines()
+        line = finding.get("line_number")
+        start = max(0, (line or 1) - 6)
+        end = min(len(lines), (line or 1) + 5)
+        evidence.append({
+            "finding": finding,
+            "file": path,
+            "code": "\n".join(f"{i + 1}: {lines[i]}" for i in range(start, end)),
+        })
 
-    framework = scan_result.get("framework", "unknown")
+    prompt = f"""You are a senior software architect. Plan minimal fixes for these VERIFIED findings.
+Do not invent findings or files. Use only the supplied evidence and return ONLY valid JSON.
+Each plan must target a small contiguous line range and include the exact replacement code in `change`.
 
-    prompt = f"""You are a senior software architect reviewing a {framework} application.
+VERIFIED FINDINGS AND EVIDENCE:
+{json.dumps(evidence, indent=2)}
 
-Analyze these source files and provide a concise architectural review:
-
-{json.dumps(sample, indent=1)}
-
-Write a brief markdown report (max 300 words) covering:
-1. **Overall Code Quality** (1-2 sentences)
-2. **Top 3 Architectural Issues** (bullet points, specific and actionable)
-3. **Quick Wins** (2-3 easy improvements that would have big impact)
-4. **Scalability Concerns** (what would break at 10x traffic)
-
-Be specific and technical. Reference actual patterns you see in the code."""
-
+Return:
+{{"fix_plans": [{{
+  "file": "app.py", "start_line": 42, "end_line": 45,
+  "problem": "what the evidence proves", "change": "replacement code for only these lines",
+  "reason": "why this fixes the verified issue", "risk": "low|medium|high"
+}}]}}"""
     try:
         response = generate_content_with_fallback(prompt)
-        return response.text
+        clean = re.sub(r"```(?:json)?", "", response.text).replace("```", "").strip()
+        parsed = json.loads(clean)
+        return parsed if isinstance(parsed, dict) else {"fix_plans": []}
     except Exception as e:
-        return f"AI analysis unavailable: {str(e)}"
+        print(f"[Architect] Fix planning failed: {e}")
+        return {"fix_plans": []}
 
 
-def analyze_architecture(repo_path: str, scan_result: dict) -> dict:
+def analyze_architecture(repo_path: str, verified_findings: list[dict]) -> dict:
     """
     Full architecture analysis.
     Returns:
@@ -201,9 +197,22 @@ def analyze_architecture(repo_path: str, scan_result: dict) -> dict:
         score: int
     }
     """
-    source_files = _read_source_files(repo_path)
-    static_issues = _static_analysis(repo_path, source_files)
-    ai_analysis = _llm_analysis(source_files, scan_result)
+    all_source_files = _read_source_files(repo_path)
+    verified_findings = [finding for finding in verified_findings if finding.get("verified")]
+    relevant_paths = {finding.get("file") or finding.get("file_name") for finding in verified_findings}
+    source_files = {path: content for path, content in all_source_files.items() if path in relevant_paths}
+    plans = _llm_analysis(source_files, verified_findings)
+    fix_plans = [plan for plan in plans.get("fix_plans", []) if plan.get("file") in relevant_paths]
+    static_issues = [{
+        "type": "verified-finding",
+        "severity": finding.get("severity", "warning"),
+        "title": finding.get("issue_title", finding.get("error_type", "Verified issue")),
+        "description": finding.get("validity_explanation", finding.get("error_description", "")),
+        "suggestion": finding.get("recommended_fix", finding.get("suggested_fix", "")),
+        "file": finding.get("file") or finding.get("file_name"),
+        "line": finding.get("line_number"),
+    } for finding in verified_findings]
+    ai_analysis = json.dumps({"verified_findings": len(verified_findings), "fix_plans": fix_plans})
 
     summary = {
         "critical": sum(1 for i in static_issues if i.get("severity") == "critical"),
@@ -226,6 +235,7 @@ def analyze_architecture(repo_path: str, scan_result: dict) -> dict:
     return {
         "static_issues": static_issues,
         "ai_analysis": ai_analysis,
+        "fix_plans": fix_plans,
         "summary": summary,
         "score": score,
     }
